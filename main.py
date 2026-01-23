@@ -11,6 +11,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
+from PIL import Image
+from torchvision import transforms as T
 
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
@@ -25,26 +27,47 @@ class HandwritingDataset(Dataset):
     def __init__(self, paths, labels, transform=None, debug=False):
         self.paths = paths
         self.labels = labels
-        self.transform = transform
         self.debug = debug
+        # đảm bảo transform luôn hợp lệ (dùng ImageNet normalization mặc định nếu None)
+        if transform is None:
+            self.transform = T.Compose([
+                T.ToTensor(),
+                T.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]),
+            ])
+        else:
+            self.transform = transform
 
     def __len__(self):
         return len(self.paths)
 
     def __getitem__(self, idx):
         p = self.paths[idx]
-        label = self.labels[idx]
-        img_np, lap_var = process_image_resize(p, target_size=(224,224), debug=False)
-        # convert numpy (H,W,3 uint8) -> PIL Image for torchvision transforms
-        from PIL import Image
-        img_pil = Image.fromarray(img_np)
-        if self.transform:
-            img_t = self.transform(img_pil)
-        else:
-            # default: ToTensor
-            transform = transforms.Compose([transforms.ToTensor()])
-            img_t = transform(img_pil)
-        return img_t, label
+        label = int(self.labels[idx])
+        try:
+            img_np, lap_var = process_image_resize(p, target_size=(224,224), debug=False)
+            if img_np is None:
+                raise ValueError("process_image_resize returned None")
+            # convert numpy to PIL Image
+            img_pil = Image.fromarray(img_np)
+            img_t = self.transform(img_pil)  # tensor, shape (C,H,W), dtype=float
+            # ensure dtype/shape
+            if not torch.is_tensor(img_t):
+                img_t = T.ToTensor()(img_pil)
+            # make sure shape is correct
+            if img_t.ndim == 3 and img_t.shape[0] == 1:
+                # single channel -> replicate to 3 channels
+                img_t = img_t.repeat(3,1,1)
+            if img_t.shape[1] != 224 or img_t.shape[2] != 224:
+                # resize fallback (rare)
+                img_t = T.Resize((224,224))(img_pil)
+                img_t = self.transform(Image.fromarray(np.array(img_t)))
+            return img_t, torch.tensor(label, dtype=torch.long)
+        except Exception as e:
+            # Log lỗi (worker vẫn in được khi num_workers=0; nếu >0, xem log trên Colab console)
+            print(f"[Dataset ERROR] idx={idx} path={p} error={e}")
+            # Trả về dummy sample (không crash) — có thể gây ảnh hưởng huấn luyện nhẹ, nhưng tránh dừng toàn bộ
+            dummy = torch.zeros((3,224,224), dtype=torch.float32)
+            return dummy, torch.tensor(label, dtype=torch.long)
 
 # -------------------------
 # Utilities
