@@ -2,11 +2,11 @@
 import cv2
 import numpy as np
 from skimage.metrics import structural_similarity as ssim
-from skimage.morphology import skeletonize
-from scipy.spatial.distance import cdist
-from preprocess import process_image_for_model, adaptive_thresh, postprocess_to_rgb
-from math import sqrt
+from preprocess import apply_clahe_gray, deskew_image, adaptive_thresh
 
+# ----------------------------
+# Helpers: patch extraction
+# ----------------------------
 def extract_patches_from_mask(mask, min_area=50, max_area=5000):
     """
     mask: binary uint8 (255 foreground)
@@ -25,122 +25,163 @@ def extract_patches_from_mask(mask, min_area=50, max_area=5000):
         patches.append({'bbox': (x,y,w,h), 'patch': patch, 'centroid': (cx,cy), 'area': area})
     return patches
 
-def compute_ssim_groups(patches, img_gray, size=(64,64), thresh=0.98):
+# ----------------------------
+# SSIM: count similar pairs
+# ----------------------------
+def compute_shape_similarity(patches, img_gray, size=(64,64), hu_thresh=0.003, orb_match_thresh=0.25, max_checks=2000):
     """
-    Compute SSIM pairwise across patches (resized to fixed size).
-    Return list of groups with count >=2 and examples.
+    Kết hợp Hu moments + ORB matching để đếm số cặp 'rất giống nhau'.
+    - patches: list như trước (bbox, patch)
+    - img_gray: grayscale của ảnh gốc (không resize)
+    Trả về {'n_pairs': int, 'flag': bool}
     """
     n = len(patches)
     if n < 2:
-        return []
-    imgs = []
-    for p in patches:
-        im = p['patch']
-        # blend with grayscale to get texture: overlay mask area from original gray
-        x,y,w,h = p['bbox']
-        crop_gray = img_gray[y:y+h, x:x+w]
-        # normalize and resize
-        if crop_gray.size == 0:
-            crop_gray = np.zeros((1,1), dtype=np.uint8)
-        imr = cv2.resize(crop_gray, size, interpolation=cv2.INTER_LINEAR)
-        imgs.append(imr)
-    groups = []
-    used = set()
-    for i in range(n):
-        if i in used: continue
-        group = [i]
-        for j in range(i+1, n):
-            val = ssim(imgs[i], imgs[j])
-            if val >= thresh:
-                group.append(j)
-        if len(group) >= 2:
-            groups.append(group)
-            used.update(group)
-    # return groups with counts
-    out = []
-    for g in groups:
-        # approximate line by y coordinate of first
-        idx0 = g[0]
-        y = patches[idx0]['centroid'][1]
-        out.append({'indices': g, 'count': len(g), 'line_y': y})
-    return out
+        return {'n_pairs': 0, 'flag': False}
 
+    # prepare crops at original size (not resized to tiny) to keep detail
+    crops = []
+    for p in patches:
+        x,y,w,h = p['bbox']
+        crop = img_gray[y:y+h, x:x+w]
+        if crop.size == 0:
+            crop = np.zeros((1,1), dtype=np.uint8)
+        crops.append(crop)
+
+    # precompute Hu moments
+    hu_list = []
+    for im in crops:
+        # binarize for moment calc
+        _, th = cv2.threshold(im, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        moments = cv2.moments(th)
+        hu = cv2.HuMoments(moments).flatten()
+        # log scale to stabilize
+        hu_log = -np.sign(hu) * np.log10(np.abs(hu)+1e-12)
+        hu_list.append(hu_log)
+
+    # ORB descriptors (for fallback)
+    orb = cv2.ORB_create(nfeatures=200)
+    orb_desc = []
+    for im in crops:
+        # try to detect on resized patch
+        im_res = cv2.resize(im, (128,128), interpolation=cv2.INTER_LINEAR)
+        kp, des = orb.detectAndCompute(im_res, None)
+        orb_desc.append(des)
+
+    count = 0
+    checked = 0
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    for i in range(n):
+        for j in range(i+1, n):
+            checked += 1
+            if checked > max_checks:
+                break
+            # first check Hu distance (fast)
+            hu_dist = np.linalg.norm(hu_list[i] - hu_list[j])
+            if hu_dist <= hu_thresh:
+                count += 1
+                continue
+            # fallback to ORB matching if Hu inconclusive and descriptors exist
+            des1 = orb_desc[i]
+            des2 = orb_desc[j]
+            if des1 is not None and des2 is not None:
+                matches = bf.match(des1, des2)
+                if len(matches) == 0:
+                    continue
+                # ratio of good matches by number of keypoints
+                good = sum(1 for m in matches if m.distance < 60)
+                denom = max(len(des1), len(des2))
+                score = good / denom if denom>0 else 0.0
+                if score >= orb_match_thresh:
+                    count += 1
+    flag = count > 0
+    return {'n_pairs': int(count), 'flag': flag}
+
+# ----------------------------
+# Spacing regularity
+# ----------------------------
 def spacing_regularilty(patches):
-    """
-    Group patches by line (y coordinate clustering), compute kerning (x distance between consecutive boxes)
-    Return CV across all distances and a flag if CV <= 0.03.
-    """
     if len(patches) < 2:
         return {'cv': None, 'flag': False}
-    # sort by y, cluster into lines using simple threshold = median height
+    # cluster by y using k-means-like (but simple agglomerative)
     heights = [p['bbox'][3] for p in patches]
-    if len(heights)==0:
-        return {'cv': None, 'flag': False}
-    median_h = np.median(heights)
-    # assign to lines
+    median_h = np.median(heights) if len(heights)>0 else 10
+    # group by line as before
     lines = {}
     for p in patches:
         cx, cy = p['centroid']
         assigned = False
         for ky in list(lines.keys()):
-            if abs(cy - ky) < median_h: # same line
+            if abs(cy - ky) < median_h:
                 lines[ky].append(p)
                 assigned = True
                 break
         if not assigned:
             lines[cy] = [p]
-    distances = []
+    cvs = []
+    n_distances = 0
+    distances_all = []
     for ky, arr in lines.items():
-        arr_sorted = sorted(arr, key=lambda q: q['bbox'][0])  # by x
+        arr_sorted = sorted(arr, key=lambda q: q['bbox'][0])
+        dists = []
         for i in range(len(arr_sorted)-1):
             x1 = arr_sorted[i]['bbox'][0] + arr_sorted[i]['bbox'][2]/2
             x2 = arr_sorted[i+1]['bbox'][0] + arr_sorted[i+1]['bbox'][2]/2
-            distances.append(abs(x2-x1))
-    if len(distances) == 0:
+            d = abs(x2-x1)
+            dists.append(d)
+            distances_all.append(d)
+        if len(dists) >= 2:
+            mu = np.mean(dists)
+            sigma = np.std(dists)
+            cvs.append(sigma / mu if mu>0 else 0.0)
+            n_distances += len(dists)
+    if len(distances_all) == 0:
         return {'cv': None, 'flag': False}
-    mu = np.mean(distances)
-    sigma = np.std(distances)
-    cv = sigma / mu if mu>0 else 0.0
-    flag = cv <= 0.03
-    return {'cv': float(cv), 'flag': flag, 'mean_distance': float(mu), 'std': float(sigma), 'n_distances': len(distances)}
+    global_mu = np.mean(distances_all)
+    global_sigma = np.std(distances_all)
+    global_cv = global_sigma / global_mu if global_mu>0 else 0.0
+    flag = global_cv <= 0.03
+    return {'cv': float(global_cv), 'flag': flag, 'mean_distance': float(global_mu), 'std': float(global_sigma), 'n_distances': n_distances}
 
+# ----------------------------
+# Stroke variability & pressure proxy
+# ----------------------------
+
+from skimage.morphology import skeletonize
 def stroke_variability_and_pressure(mask, img_gray):
-    """
-    Estimate stroke width using distance transform on mask.
-    Compute CV_w, std_I, R (edge roughness normalized).
-    """
     binmask = (mask>0).astype(np.uint8)
-    # distance transform on foreground (distance to background) gives half stroke width approx
-    dist = cv2.distanceTransform(255 - binmask*255, cv2.DIST_L2, 5)  # distance on background => not directly
-    # better: invert mask, distance to background from mask skeleton? alternative compute thickness via medial axis
-    # We'll use: distance transform on inverse mask to get background distances then approximate widths on mask pixels
-    dt = cv2.distanceTransform(binmask*255, cv2.DIST_L2, 5)
-    stroke_pixels = dt[dt>0]
-    if stroke_pixels.size == 0:
+    if binmask.sum() == 0:
+        return {'cv_w':0.0, 'mean_w':0.0, 'std_I':0.0, 'R':0.0}
+    # distance transform of mask (distance to background)
+    dt = cv2.distanceTransform((binmask*255).astype(np.uint8), cv2.DIST_L2, 5)
+    # compute skeleton in binary, use skimage's skeletonize on boolean
+    skel = skeletonize(binmask.astype(bool)).astype(np.uint8)
+    # sample DT values at skeleton points -> local half-width
+    skel_vals = dt[skel==1]
+    if skel_vals.size == 0:
         mean_w = 0.0
         cv_w = 0.0
     else:
-        # approximate stroke width = 2 * distance transform
-        widths = 2.0 * stroke_pixels
+        widths = 2.0 * skel_vals  # approximate stroke widths
         mean_w = float(np.mean(widths))
         std_w = float(np.std(widths))
         cv_w = std_w / mean_w if mean_w>0 else 0.0
 
-    # std_I: intensity std of ink pixels in grayscale normalized [0,1]
-    ink_pixels = img_gray[binmask>0].astype(np.float32)/255.0
-    std_I = float(np.std(ink_pixels)) if ink_pixels.size>0 else 0.0
+    # intensity std of ink pixels in original gray (normalized)
+    ink_vals = img_gray[binmask>0].astype(np.float32)/255.0
+    std_I = float(np.std(ink_vals)) if ink_vals.size>0 else 0.0
 
-    # Edge roughness R: find contours and compute mean deviation of contour radius to centroid normalized by mean stroke width
+    # edge roughness R: use contour curvature variance normalized by mean width
     contours, _ = cv2.findContours((binmask*255).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     deviations = []
     for cnt in contours:
         if len(cnt) < 5:
             continue
+        # compute curvature-like deviation: distance from contour points to fitted ellipse/mean radius
         M = cv2.moments(cnt)
         if M['m00'] == 0:
             continue
-        cx = M['m10']/M['m00']
-        cy = M['m01']/M['m00']
+        cx = M['m10']/M['m00']; cy = M['m01']/M['m00']
         dists = np.sqrt(((cnt[:,0,0]-cx)**2 + (cnt[:,0,1]-cy)**2))
         mean_r = np.mean(dists)
         dev = np.mean(np.abs(dists - mean_r))
@@ -150,14 +191,16 @@ def stroke_variability_and_pressure(mask, img_gray):
 
     return {'cv_w': float(cv_w), 'mean_w': float(mean_w), 'std_I': float(std_I), 'R': float(R)}
 
+# ----------------------------
+# Baseline alignment
+# ----------------------------
+
+from sklearn.linear_model import RANSACRegressor
+from sklearn.linear_model import LinearRegression
+
 def baseline_alignment(patches):
-    """
-    For each line estimate baseline as median of bottom y of bboxes, compute std of bottoms relative to baseline.
-    Return average std across lines.
-    """
     if len(patches) == 0:
         return {'std_baseline': None, 'flag': False}
-    # group into lines similar to spacing
     heights = [p['bbox'][3] for p in patches]
     median_h = np.median(heights) if len(heights)>0 else 10
     lines = {}
@@ -173,25 +216,32 @@ def baseline_alignment(patches):
             lines[cy] = [p]
     stds = []
     for ky, arr in lines.items():
-        bottoms = [p['bbox'][1] + p['bbox'][3] for p in arr]
-        if len(bottoms) < 2:
+        if len(arr) < 3:
             continue
-        sigma = float(np.std(bottoms))
-        stds.append(sigma)
-    if len(stds)==0:
+        X = np.array([ [p['centroid'][0]] for p in arr ])  # x positions
+        Y = np.array([ p['bbox'][1] + p['bbox'][3] for p in arr ])  # bottom y
+        try:
+            ransac = RANSACRegressor(LinearRegression(), residual_threshold=2.0, random_state=42)
+            ransac.fit(X, Y)
+            inlier_mask = ransac.inlier_mask_
+            residuals = np.abs(Y[inlier_mask] - ransac.predict(X[inlier_mask]))
+            if residuals.size > 0:
+                stds.append(float(np.std(residuals)))
+        except Exception:
+            # fallback to simple std
+            stds.append(float(np.std(Y)))
+    if len(stds) == 0:
         return {'std_baseline': None, 'flag': False}
     mean_std = float(np.mean(stds))
     flag = mean_std <= 0.5
     return {'std_baseline': mean_std, 'flag': flag, 'n_lines': len(stds)}
 
+# ----------------------------
+# Continuity score
+# ----------------------------
 def continuity_score(patches, mask):
-    """
-    For adjacent patches in same line, compute gradient continuity at junction.
-    Return number of junctions with continuity < 0.4 and overall mean continuity.
-    """
     if len(patches) < 2:
         return {'mean_cont': None, 'n_bad': 0, 'bad_examples': []}
-    # group lines
     heights = [p['bbox'][3] for p in patches] if len(patches)>0 else [10]
     median_h = np.median(heights)
     lines = {}
@@ -216,25 +266,20 @@ def continuity_score(patches, mask):
         for i in range(len(arr_sorted)-1):
             a = arr_sorted[i]
             b = arr_sorted[i+1]
-            # compute junction box between right half of a and left half of b
             x1 = int(a['bbox'][0] + 0.6*a['bbox'][2])
             x2 = int(b['bbox'][0] + 0.4*b['bbox'][2])
             y1 = int(min(a['bbox'][1], b['bbox'][1]) - 2)
             y2 = int(max(a['bbox'][1]+a['bbox'][3], b['bbox'][1]+b['bbox'][3]) + 2)
             if x2 <= x1 or y2<=y1:
-                # tiny or overlapping; crop small region around seam
                 x1 = max(0, a['bbox'][0]+a['bbox'][2]-5)
                 x2 = min(mask.shape[1]-1, b['bbox'][0]+5)
                 y1 = max(0, int(min(a['bbox'][1], b['bbox'][1])))
                 y2 = min(mask.shape[0]-1, int(max(a['bbox'][1]+a['bbox'][3], b['bbox'][1]+b['bbox'][3])))
-            # guard bounds
             x1 = max(0, x1); x2 = min(mask.shape[1]-1, x2)
             y1 = max(0, y1); y2 = min(mask.shape[0]-1, y2)
             if x2<=x1 or y2<=y1:
                 continue
             region_grad = grad_mag[y1:y2, x1:x2]
-            # measure continuity as normalized inverse of gradient magnitude variance:
-            # if gradient is low and smooth -> continuity high (close to 1)
             mean_g = np.mean(region_grad)
             std_g = np.std(region_grad)
             cont = 1.0 - (std_g / (mean_g + 1e-8))
@@ -246,49 +291,37 @@ def continuity_score(patches, mask):
     mean_cont = float(np.mean(cont_values)) if len(cont_values)>0 else None
     return {'mean_continuity': mean_cont, 'n_bad': bad_count, 'bad_examples': bad_examples}
 
+# ----------------------------
+# High-level analyzer
+# ----------------------------
 def analyze_image_for_evidence(image_path):
     """
-    High-level function:
-    - produce binary mask + grayscale (using preprocess pipeline)
-    - extract patches
-    - compute all 5 checks and return structured result
+    Return a dict with keys: ssim, spacing, stroke, baseline, continuity
+    Each value contains {'flag': bool, ...stats...}
     """
-    # reuse preprocess: get grayscale and mask
-    # process_image_for_model returns rgb and laplacian; we need gray and mask
     import cv2
     img_bgr = cv2.imdecode(np.fromfile(image_path, dtype=np.uint8), cv2.IMREAD_COLOR)
     if img_bgr is None:
         raise ValueError("Cannot read image")
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    # CLAHE and deskew from preprocess
-    from preprocess import apply_clahe_gray, deskew_image, adaptive_thresh
     clahe = apply_clahe_gray(gray)
     deskewed = deskew_image(clahe)
     mask = adaptive_thresh(deskewed)  # binary inverted (text=white)
-    # convert mask to 0/1
     mask01 = (mask>0).astype(np.uint8)
     patches = extract_patches_from_mask(mask)
-    # SSIM groups
-    ssim_groups = compute_ssim_groups(patches, deskewed, size=(64,64), thresh=0.98)
-    ssim_flag = len(ssim_groups) > 0
-    # Spacing
+    ssim_res = compute_shape_similarity(patches, deskewed, size=(64,64),
+                                        hu_thresh=0.003, orb_match_thresh=0.25, max_checks=2000)
     spacing = spacing_regularilty(patches)
-    spacing_flag = spacing.get('flag', False)
-    # Stroke variability
     stroke = stroke_variability_and_pressure(mask01, deskewed)
     stroke_flag = (stroke['cv_w'] <= 0.03) and (stroke['std_I'] <= 0.06) and (stroke['R'] <= 0.12)
-    # Baseline
     baseline = baseline_alignment(patches)
-    baseline_flag = baseline.get('flag', False)
-    # Continuity
     continuity = continuity_score(patches, mask01)
-    continuity_flag = continuity.get('n_bad', 0) > 0
 
     result = {
-        'ssim': {'flag': ssim_flag, 'groups': ssim_groups},
-        'spacing': {'flag': spacing_flag, **spacing},
+        'ssim': {'flag': ssim_res['flag'], 'n_pairs': ssim_res['n_pairs']},
+        'spacing': {'flag': spacing.get('flag', False), **spacing},
         'stroke': {'flag': stroke_flag, **stroke},
-        'baseline': {'flag': baseline_flag, **baseline},
-        'continuity': {'flag': continuity_flag, **continuity}
+        'baseline': {'flag': baseline.get('flag', False), **baseline},
+        'continuity': {'flag': continuity.get('n_bad', 0) > 0, **continuity}
     }
     return result
