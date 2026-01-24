@@ -9,7 +9,7 @@ MODEL_PATH = "best_model.pth"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def open_and_predict():
-    path = filedialog.askopenfilename(filetypes=[("Images","*.jpg *.jpeg *.png *.bmp *.tiff")])
+    path = filedialog.askopenfilename(filetypes=[("Images","*.jpg *.jpeg *.png *.bmp *.tiff *.jfif *.webp")])
     if not path:
         return
 
